@@ -31,6 +31,10 @@
 #define OLED_SDA_PIN    GPIO_Pin_1   /* PA1 */
 #define OLED_PORT_GPIO  GPIOA
 
+/* LED + 蜂鸣器 */
+#define LED_PIN    GPIO_Pin_5   /* PA5, 高电平亮 */
+#define BEEP_PIN   GPIO_Pin_4   /* PA4, 低电平响 */
+
 /* ---- OLED I2C 微秒延时 (96MHz下 Delay_Us(5)≈标准模式) ---- */
 #define O_Delay()  Delay_Us(5)
 
@@ -336,6 +340,19 @@ static void GPIO_Init_All(void)
     O_SCL_H();
     O_SDA_H();
 
+    /* LED PA5 推挽输出 (高电平亮) */
+    c.GPIO_Pin   = LED_PIN;
+    c.GPIO_Mode  = GPIO_Mode_Out_PP;
+    c.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(OLED_PORT_GPIO, &c);
+    GPIO_ResetBits(OLED_PORT_GPIO, LED_PIN);   /* 初始灭 */
+
+    /* 蜂鸣器 PA4 推挽输出 (低电平响) */
+    c.GPIO_Pin   = BEEP_PIN;
+    c.GPIO_Mode  = GPIO_Mode_Out_PP;
+    GPIO_Init(OLED_PORT_GPIO, &c);
+    GPIO_SetBits(OLED_PORT_GPIO, BEEP_PIN);    /* 初始关 */
+
     /* MAX30102 SCL(PE12推挽) + SDA(PE13推挽, 方向动态切换) */
     c.GPIO_Pin   = MAX_SCL_PIN;
     c.GPIO_Mode  = GPIO_Mode_Out_PP;
@@ -364,6 +381,17 @@ int main(void)
     GPIO_Init_All();
     O_Init();
     O_Clear();
+
+    /*---- 启动自检: LED 慢闪3次 + 蜂鸣器短鸣1次 ----*/
+    {
+        int bl;
+        for(bl = 0; bl < 3; bl++) {
+            GPIO_SetBits(OLED_PORT_GPIO, LED_PIN);   Delay_Ms(200);
+            GPIO_ResetBits(OLED_PORT_GPIO, LED_PIN);  Delay_Ms(200);
+        }
+        GPIO_ResetBits(OLED_PORT_GPIO, BEEP_PIN);     Delay_Ms(100);
+        GPIO_SetBits(OLED_PORT_GPIO, BEEP_PIN);
+    }
 
     /*---- 屏显标题 ----*/
     O_ShowStr(0, 0, "MAX30102 I2C TEST");
