@@ -1,0 +1,31 @@
+# MounRiver Studio / CH32V307 项目
+Debug/
+obj/
+.mrs/
+*.o
+*.d
+*.crf
+*.hex
+*.bin
+*.axf
+*.lnp
+*.sct
+*.map
+*.htm
+*.build_log.htm
+*.wvproj
+.settings/
+JLinkLog.txt
+JLinkSettings.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini

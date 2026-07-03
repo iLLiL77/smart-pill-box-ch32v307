@@ -1,0 +1,27 @@
+主控板：CH32V307V
+
+引脚：
+PA0 -- OLED1-SCL
+PA1 -- OLED1-SDA
+PA2 -- OLED2-SCL
+PA3 -- OLED2-SDA
+PA4 -- Buzzer
+PA5 -- LED
+
+PA6 -- Button4
+PA7 -- 对射红外传感器
+PA8 -- Button1
+PA9 -- Button2
+PA10 -- Button3
+
+PE8 -- 称重1DT
+PE9 -- 称重1SCK
+PE10 -- 称重2DT
+PE11 -- 称重2SCK
+PE12 -- MAX30102-SCL
+PE13 -- MAX30102-SDA
+
+PB1 -- MAX30102-INT
+
+
+
