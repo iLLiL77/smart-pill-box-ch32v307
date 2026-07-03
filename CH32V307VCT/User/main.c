@@ -1,446 +1,352 @@
 /**********************************************
- * 智能药盒 — 双药盒独立配置、多时段提醒、取药检测
+ * 第1步: MAX30102 I2C 极简测试 — 只读 PART_ID (0xFF)
  *
- * LED:  PA5 高电平亮 (SetBits=ON, ResetBits=OFF)
- * BEEP: PA4 低电平响 (ResetBits=ON, SetBits=OFF)
+ * 预期: 返回 0x15 → 硬件OK, 进入第2步
+ *       返回 0x00/0xFF/乱码 → 检查:
+ *          1. 3.3V供电
+ *          2. PE12=SCL, PE13=SDA 是否接反
+ *          3. GND 共地
+ *          4. I2C延时不够 (已设 Delay_Us(5) = ~100kHz)
+ *          5. 芯片是否损坏
  *
- * 按键: K1(PA8 MODE)=切换选项  K2(PA9 ADD)=加值  K3(PA10 OK)=确认/下一页
+ * OLED 显示:
+ *   Row0: "MAX30102 I2C TEST"
+ *   Row1: "PART_ID: 0x??"
+ *   Row2: "PASS!!" or "FAIL!!"
+ *   Row3: 重读次数
+ * INT 引脚悬空不接 (本测试用FIFO指针, 不用中断)
  *
- * 三态系统:
- *   STATE_SETUP(0) — 三页菜单设置两个药盒+当前时间
- *   STATE_RUN  (1) — 走时+闹钟检测
- *   STATE_ALERT(2) — 声光提醒+取药检测(重量+红外双重判定)
+ * 编译: MounRiver Studio → Build → Download
  **********************************************/
 
-#include "config.h"
-#include "gpio.h"
-#include "key.h"
-#include "hx711.h"
-#include "usart_voice.h"
-#include "oled.h"
-#include "max30102.h"
+#include "debug.h"
+#include "ch32v30x_gpio.h"
+#include "ch32v30x_rcc.h"
 
 /*==========================================================================
- * LED/BEEP 快捷宏
+ * OLED 简化驱动 (只用到 OLED1: PA0=SCL, PA1=SDA)
  *==========================================================================*/
-#define LED_ON()    GPIO_SetBits(GPIOA, LED_PIN)
-#define LED_OFF()   GPIO_ResetBits(GPIOA, LED_PIN)
-#define BEEP_ON()   GPIO_ResetBits(BEEP_PORT, BEEP_PIN)
-#define BEEP_OFF()  GPIO_SetBits(BEEP_PORT, BEEP_PIN)
+#define OLED_ADDR  0x78
+#define OLED_SCL_PIN    GPIO_Pin_0   /* PA0 */
+#define OLED_SDA_PIN    GPIO_Pin_1   /* PA1 */
+#define OLED_PORT_GPIO  GPIOA
 
-/* 红外传感器 (PA7, 遮挡=低=开盖) */
-#define IR_BLOCKED()  (GPIO_ReadInputDataBit(GPIOA, PHOTO_PIN) == 0)
+/* ---- OLED I2C 微秒延时 (96MHz下 Delay_Us(5)≈标准模式) ---- */
+#define O_Delay()  Delay_Us(5)
 
-void Delay_ms(uint32_t ms) { Delay_Ms(ms); }
+static void O_SDA_H(void) { GPIO_SetBits(OLED_PORT_GPIO, OLED_SDA_PIN); }
+static void O_SDA_L(void) { GPIO_ResetBits(OLED_PORT_GPIO, OLED_SDA_PIN); }
+static void O_SCL_H(void) { GPIO_SetBits(OLED_PORT_GPIO, OLED_SCL_PIN); }
+static void O_SCL_L(void) { GPIO_ResetBits(OLED_PORT_GPIO, OLED_SCL_PIN); }
 
-/*==========================================================================
- * 全局变量定义
- *==========================================================================*/
-MedConfig med[MED_COUNT] = {
-    {1, 1, {8,  12, 18}, {0, 0, 0}},   /* 药盒1: 1粒,1次/天,默认8:00 */
-    {1, 1, {12, 18, 20}, {0, 0, 0}}    /* 药盒2: 1粒,1次/天,默认12:00 */
+static void O_SDA_OUT(void)
+{
+    GPIO_InitTypeDef c;
+    c.GPIO_Pin   = OLED_SDA_PIN;
+    c.GPIO_Mode  = GPIO_Mode_Out_PP;
+    c.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(OLED_PORT_GPIO, &c);
+}
+static void O_SDA_IN(void)
+{
+    GPIO_InitTypeDef c;
+    c.GPIO_Pin   = OLED_SDA_PIN;
+    c.GPIO_Mode  = GPIO_Mode_IPU;
+    c.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(OLED_PORT_GPIO, &c);
+}
+static uint8_t O_READ_SDA(void) { return GPIO_ReadInputDataBit(OLED_PORT_GPIO, OLED_SDA_PIN); }
+
+static void O_Start(void)
+{
+    O_SDA_OUT(); O_SDA_H(); O_SCL_H(); O_Delay();
+    O_SDA_L();   O_Delay(); O_SCL_L(); O_Delay();
+}
+static void O_Stop(void)
+{
+    O_SDA_OUT(); O_SCL_L(); O_SDA_L(); O_Delay();
+    O_SCL_H();   O_SDA_H(); O_Delay();
+}
+static uint8_t O_WaitAck(void)
+{
+    uint8_t t=0; O_SDA_IN(); O_SDA_H(); O_Delay();
+    O_SCL_H(); O_Delay();
+    while(O_READ_SDA()){if(++t>200){O_SCL_L();return 1;}}
+    O_SCL_L(); O_Delay(); return 0;
+}
+static void O_Ack(void)   { O_SCL_L(); O_Delay(); O_SDA_OUT(); O_SDA_L(); O_Delay(); O_SCL_H(); O_Delay(); O_SCL_L(); O_Delay(); }
+static void O_NAck(void)  { O_SCL_L(); O_Delay(); O_SDA_OUT(); O_SDA_H(); O_Delay(); O_SCL_H(); O_Delay(); O_SCL_L(); O_Delay(); }
+static void O_SendByte(uint8_t d)
+{
+    uint8_t t; O_SDA_OUT(); O_SCL_L(); O_Delay();
+    for(t=0;t<8;t++){if(d&0x80)O_SDA_H();else O_SDA_L(); d<<=1; O_Delay(); O_SCL_H(); O_Delay(); O_SCL_L(); O_Delay();}
+}
+static uint8_t O_ReadByte(uint8_t ack)
+{
+    uint8_t i,r=0; O_SDA_IN();
+    for(i=0;i<8;i++){O_SCL_L();O_Delay();O_SCL_H();r<<=1;if(O_READ_SDA())r++;O_Delay();}
+    O_SCL_L(); O_Delay(); if(ack)O_Ack();else O_NAck(); return r;
+}
+
+/* ---- OLED 写命令/数据 ---- */
+static void O_WriteCmd(uint8_t cmd)
+{
+    O_Start(); O_SendByte(OLED_ADDR<<1); O_WaitAck();
+    O_SendByte(0x00); O_WaitAck();
+    O_SendByte(cmd);  O_WaitAck();
+    O_Stop();
+}
+static void O_WriteData(uint8_t dat)
+{
+    O_Start(); O_SendByte(OLED_ADDR<<1); O_WaitAck();
+    O_SendByte(0x40); O_WaitAck();
+    O_SendByte(dat);  O_WaitAck();
+    O_Stop();
+}
+static void O_Init(void)
+{
+    Delay_Ms(100);
+    O_WriteCmd(0xAE); O_WriteCmd(0x20); O_WriteCmd(0x00); /* 水平寻址 */
+    O_WriteCmd(0xB0); O_WriteCmd(0xC8); /* 从上到下 */
+    O_WriteCmd(0x00); O_WriteCmd(0x10); /* 低/高列起始 */
+    O_WriteCmd(0x40); /* 显示起始行 */
+    O_WriteCmd(0x8D); O_WriteCmd(0x14); /* 电荷泵 */
+    O_WriteCmd(0xA1); O_WriteCmd(0xA6); /* 正常显示 */
+    O_WriteCmd(0xA8); O_WriteCmd(0x3F); /* MUX=64 */
+    O_WriteCmd(0xD3); O_WriteCmd(0x00);
+    O_WriteCmd(0xD5); O_WriteCmd(0xF0);
+    O_WriteCmd(0xD9); O_WriteCmd(0x22);
+    O_WriteCmd(0xDA); O_WriteCmd(0x12);
+    O_WriteCmd(0xDB); O_WriteCmd(0x20);
+    O_WriteCmd(0x81); O_WriteCmd(0xCF);
+    O_WriteCmd(0xA4); O_WriteCmd(0xAF); /* 开显示 */
+}
+static void O_SetPos(uint8_t x, uint8_t y)
+{
+    O_WriteCmd(0xB0+y);
+    O_WriteCmd(((x&0xF0)>>4)|0x10);
+    O_WriteCmd((x&0x0F));
+}
+static void O_Clear(void)
+{
+    uint8_t i,j;
+    for(i=0;i<8;i++){O_SetPos(0,i);for(j=0;j<128;j++)O_WriteData(0x00);}
+}
+
+/* 6x8字体 */
+static const uint8_t f6x8[][6] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00}, /* ' ' */
+    {0x00,0x00,0x00,0x4F,0x00,0x00}, /* ! */
+    {0x00,0x3E,0x51,0x49,0x45,0x3E}, /* 0 */
+    {0x00,0x00,0x42,0x7F,0x40,0x00}, /* 1 */
+    {0x00,0x42,0x61,0x51,0x49,0x46}, /* 2 */
+    {0x00,0x21,0x41,0x45,0x4B,0x31}, /* 3 */
+    {0x00,0x18,0x14,0x12,0x7F,0x10}, /* 4 */
+    {0x00,0x27,0x45,0x45,0x45,0x39}, /* 5 */
+    {0x00,0x3C,0x4A,0x49,0x49,0x30}, /* 6 */
+    {0x00,0x01,0x71,0x09,0x05,0x03}, /* 7 */
+    {0x00,0x36,0x49,0x49,0x49,0x36}, /* 8 */
+    {0x00,0x06,0x49,0x49,0x29,0x1E}, /* 9 */
+    {0x00,0x7E,0x11,0x11,0x11,0x7E}, /* A */
+    {0x00,0x7F,0x49,0x49,0x49,0x36}, /* B */
+    {0x00,0x3E,0x41,0x41,0x41,0x22}, /* C */
+    {0x00,0x7F,0x41,0x41,0x22,0x1C}, /* D */
+    {0x00,0x7F,0x49,0x49,0x49,0x41}, /* E */
+    {0x00,0x7F,0x09,0x09,0x01,0x01}, /* F */
+    {0x00,0x3E,0x41,0x51,0x32,0x00}, /* G */   /* pass的简写 */
+    {0x00,0x7F,0x08,0x08,0x08,0x7F}, /* H */
+    {0x00,0x00,0x41,0x7F,0x41,0x00}, /* I */
+    {0x00,0x30,0x40,0x41,0x3F,0x01}, /* J */
+    {0x00,0x00,0x00,0x00,0x00,0x00}, /* K (用空格) */
+    {0x00,0x7F,0x40,0x40,0x40,0x40}, /* L */
+    {0x00,0x7F,0x02,0x0C,0x02,0x7F}, /* M */
+    {0x00,0x7F,0x04,0x08,0x10,0x7F}, /* N */
+    {0x00,0x3E,0x41,0x41,0x41,0x3E}, /* O */
+    {0x00,0x7F,0x09,0x09,0x09,0x06}, /* P */
+    {0x00,0x3E,0x41,0x51,0x21,0x5E}, /* Q */
+    {0x00,0x7F,0x09,0x19,0x29,0x46}, /* R */
+    {0x00,0x46,0x49,0x49,0x49,0x31}, /* S */
+    {0x00,0x01,0x01,0x7F,0x01,0x01}, /* T */
+    {0x00,0x3F,0x40,0x40,0x40,0x3F}, /* U */
+    {0x00,0x1F,0x20,0x40,0x20,0x1F}, /* V */
+    {0x00,0x7F,0x20,0x18,0x20,0x7F}, /* W */
+    {0x00,0x63,0x14,0x08,0x14,0x63}, /* X */
+    {0x00,0x03,0x04,0x78,0x04,0x03}, /* Y */
+    {0x00,0x61,0x51,0x49,0x45,0x43}, /* Z */
 };
-uint8_t  cur_h = 8, cur_m = 0;          /* 当前时间 */
-uint8_t  sel_page  = 0;                 /* 设置页: 0=药盒1, 1=药盒2, 2=当前时间 */
-uint8_t  sel_item  = 0;                 /* 页内选项索引 */
-uint8_t  sys_state = STATE_SETUP;       /* 系统状态 */
-volatile uint8_t  refresh_flag = 1;
-volatile uint32_t rtc_seconds  = 0;
 
-uint8_t  alert_flag  [MED_COUNT];       /* 各药盒触发标记(本次) */
-uint8_t  voice_ok    [MED_COUNT];       /* 语音已播标记 */
-float    origin_w    [MED_COUNT];       /* 触发时初始重量 */
-uint32_t hx_buf      [MED_COUNT];       /* 去皮值 */
-float    scale = SCALE_DEFAULT;         /* HX711 标定系数 */
-
-uint8_t  triggered[MED_COUNT][MAX_SLOTS]; /* 今天各时段是否已触发 */
-uint8_t  alert_med = 0;                   /* 当前告警的药盒 */
-uint32_t entry_sec = 0;                   /* 进入运行时的秒数(防误触发) */
-uint8_t  last_min  = 0xFF;                /* 上一分钟(分钟沿检测) */
-
-/*==========================================================================
- * TIM2: 1Hz 时间基准
- * 系统时钟=96MHz, APB1=48MHz, TIM2_CLK=96MHz(APB1*2)
- * Prescaler=9600-1, Period=10000-1 → 1Hz
- *==========================================================================*/
-static void TIM2_Init(void)
+static void O_ShowChar(uint8_t x, uint8_t y, char ch)
 {
-    TIM_TimeBaseInitTypeDef tim;
-    NVIC_InitTypeDef nvic;
-
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
-    TIM_TimeBaseStructInit(&tim);
-    tim.TIM_Prescaler     = 9600 - 1;
-    tim.TIM_Period        = 10000 - 1;
-    tim.TIM_ClockDivision = TIM_CKD_DIV1;
-    tim.TIM_CounterMode   = TIM_CounterMode_Up;
-    TIM_TimeBaseInit(TIM2, &tim);
-    TIM_ITConfig(TIM2, TIM_IT_Update, ENABLE);
-    TIM_Cmd(TIM2, ENABLE);
-
-    nvic.NVIC_IRQChannel = TIM2_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 1;
-    nvic.NVIC_IRQChannelSubPriority = 0;
-    nvic.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_Init(&nvic);
+    uint8_t i, idx;
+    if(ch == ' ') idx = 0;
+    else if(ch >= '0' && ch <= '9') idx = 1 + (ch - '0');  /* 1-11 */
+    else if(ch >= 'A' && ch <= 'F') idx = 12 + (ch - 'A'); /* 12-17 */
+    else if(ch == 'x') idx = 29;  /* X */
+    else return;
+    O_SetPos(x, y);
+    for(i = 0; i < 6; i++) O_WriteData(f6x8[idx][i]);
 }
-
-void TIM2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void TIM2_IRQHandler(void)
+static void O_ShowStr(uint8_t x, uint8_t y, const char *s)
 {
-    if(TIM_GetITStatus(TIM2, TIM_IT_Update) != RESET)
-    {
-        TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
-        rtc_seconds++;
-        refresh_flag = 1;
-    }
+    while(*s) { O_ShowChar(x, y, *s); x += 6; s++; }
+}
+static void O_ShowHex(uint8_t x, uint8_t y, uint8_t val)
+{
+    char nib = (val >> 4) & 0x0F;
+    char c0 = (nib < 10) ? ('0' + nib) : ('A' + nib - 10);
+    nib = val & 0x0F;
+    char c1 = (nib < 10) ? ('0' + nib) : ('A' + nib - 10);
+    O_ShowChar(x, y, c0);
+    O_ShowChar(x+6, y, c1);
 }
 
 /*==========================================================================
- * 获取当前页的选项数量
+ * MAX30102 软件I2C — PE12=SCL, PE13=SDA, 地址 0xAE(W) / 0xAF(R)
  *==========================================================================*/
-static uint8_t PageItems(uint8_t page)
+#define MAX_SCL_PIN  GPIO_Pin_12
+#define MAX_SDA_PIN  GPIO_Pin_13
+#define MAX_PORT     GPIOE
+#define MAX_ADDR_W   0xAE   /* 0x57<<1 | 0 */
+#define MAX_ADDR_R   0xAF   /* 0x57<<1 | 1 */
+
+static void M_SDA_H(void) { GPIO_SetBits(MAX_PORT, MAX_SDA_PIN); }
+static void M_SDA_L(void) { GPIO_ResetBits(MAX_PORT, MAX_SDA_PIN); }
+static void M_SCL_H(void) { GPIO_SetBits(MAX_PORT, MAX_SCL_PIN); }
+static void M_SCL_L(void) { GPIO_ResetBits(MAX_PORT, MAX_SCL_PIN); }
+static uint8_t M_READ_SDA(void) { return GPIO_ReadInputDataBit(MAX_PORT, MAX_SDA_PIN); }
+
+static void M_SDA_OUT(void)
 {
-    if(page == 0 || page == 1)
-        return 2 + med[page].times_per_day * 2; /* pills+times + H/M各一 */
-    else
-        return 2;                                /* cur_h, cur_m */
+    GPIO_InitTypeDef c;
+    c.GPIO_Pin   = MAX_SDA_PIN;
+    c.GPIO_Mode  = GPIO_Mode_Out_PP;
+    c.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(MAX_PORT, &c);
+}
+static void M_SDA_IN(void)
+{
+    GPIO_InitTypeDef c;
+    c.GPIO_Pin   = MAX_SDA_PIN;
+    c.GPIO_Mode  = GPIO_Mode_IPU;
+    c.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(MAX_PORT, &c);
+}
+
+/* ---- MAX30102 I2C 时序 (Delay_Us(5)=~100kHz标准模式) ---- */
+#define M_DELAY  Delay_Us(5)
+
+static void M_Start(void)
+{
+    M_SDA_OUT(); M_SDA_H(); M_SCL_H(); M_DELAY;
+    M_SDA_L();   M_DELAY; M_SCL_L(); M_DELAY;
+}
+static void M_Stop(void)
+{
+    M_SDA_OUT(); M_SCL_L(); M_SDA_L(); M_DELAY;
+    M_SCL_H(); M_SDA_H(); M_DELAY;
+}
+static uint8_t M_WaitAck(void)
+{
+    uint8_t t = 0;
+    M_SDA_IN(); M_SDA_H(); M_DELAY;
+    M_SCL_H();  M_DELAY;
+    while(M_READ_SDA()) { if(++t > 250) { M_SCL_L(); return 1; } }
+    M_SCL_L(); M_DELAY;
+    return 0;
+}
+static void M_SendByte(uint8_t d)
+{
+    uint8_t t;
+    M_SDA_OUT(); M_SCL_L(); M_DELAY;
+    for(t = 0; t < 8; t++) {
+        if(d & 0x80) M_SDA_H(); else M_SDA_L();
+        d <<= 1;
+        M_DELAY; M_SCL_H(); M_DELAY; M_SCL_L(); M_DELAY;
+    }
+}
+static uint8_t M_ReadByte(uint8_t ack)
+{
+    uint8_t i, r = 0;
+    M_SDA_IN();
+    for(i = 0; i < 8; i++) {
+        M_SCL_L(); M_DELAY; M_SCL_H(); M_DELAY;
+        r <<= 1; if(M_READ_SDA()) r++;
+    }
+    M_SCL_L(); M_DELAY;
+    if(ack) { M_SDA_OUT(); M_SDA_L(); }  /* ACK */
+    else    { M_SDA_OUT(); M_SDA_H(); }  /* NACK */
+    M_DELAY; M_SCL_H(); M_DELAY; M_SCL_L(); M_DELAY;
+    return r;
+}
+
+/* ---- 核心函数: 读 MAX30102 单寄存器 ---- */
+static uint8_t MAX_ReadReg(uint8_t reg)
+{
+    uint8_t val;
+
+    /* 第1帧: START + 写地址 + 寄存器号 */
+    M_Start();
+    M_SendByte(MAX_ADDR_W);
+    if(M_WaitAck()) { M_Stop(); return 0xFF; }  /* NACK=器件不存在 */
+
+    M_SendByte(reg);
+    if(M_WaitAck()) { M_Stop(); return 0xFE; }
+
+    /* 第2帧: Repeated START + 读地址 + 读数据 */
+    M_Start();
+    M_SendByte(MAX_ADDR_R);
+    if(M_WaitAck()) { M_Stop(); return 0xFD; }
+
+    val = M_ReadByte(0);  /* NACK after last byte */
+    M_Stop();
+
+    return val;
+}
+
+/* ---- 写单寄存器 (测试用) ---- */
+static uint8_t MAX_WriteReg(uint8_t reg, uint8_t val)
+{
+    M_Start();
+    M_SendByte(MAX_ADDR_W); if(M_WaitAck()) { M_Stop(); return 0; }
+    M_SendByte(reg);        if(M_WaitAck()) { M_Stop(); return 0; }
+    M_SendByte(val);        if(M_WaitAck()) { M_Stop(); return 0; }
+    M_Stop();
+    return 1;
 }
 
 /*==========================================================================
- * OLED2 显示初始化 — 全屏绘制(重量+心率血氧)
- * Row 0: 心率血氧  Row 1: 分隔线
- * Row 2-3: 重量    Row 6-7: 去皮提示
+ * GPIO 初始化
  *==========================================================================*/
-static void Show_OLED2_Init(void)
+static void GPIO_Init_All(void)
 {
-    OLED_Select(1);
-    OLED_Clear();
-    OLED_Show_Str(0, 0, "HR:---bpm SpO2:--%");
-    OLED_Show_Str(0, 1, "-------------------");
-    OLED_Show_Str(0, 2, "W1:");
-    OLED_Show_Str(0, 3, "W2:");
-    OLED_Show_Str(0, 6, "Tare:");
-    OLED_Show_Str(0, 7, "M=Box1  A=Box2");
-    OLED_Select(0);
-}
+    GPIO_InitTypeDef c;
 
-/*==========================================================================
- * OLED2 显示 — 更新重量+心率血氧(不清全屏,不闪屏)
- *==========================================================================*/
-static void Show_OLED2(void)
-{
-    float w1 = Get_Weight(MED_A);
-    float w2 = Get_Weight(MED_B);
-    int16_t hr   = MAX30102_GetHR();
-    uint8_t spo2 = MAX30102_GetSpO2();
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);  /* OLED */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOE, ENABLE);  /* MAX30102 */
 
-    if(w1 < 0) w1 = 0;
-    if(w2 < 0) w2 = 0;
+    /* OLED SCL(PA0推挽) + SDA(PA1推挽, OLED I2C用推挽+方向切换) */
+    c.GPIO_Pin   = OLED_SCL_PIN;
+    c.GPIO_Mode  = GPIO_Mode_Out_PP;
+    c.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(OLED_PORT_GPIO, &c);
 
-    OLED_Select(1);
+    c.GPIO_Pin   = OLED_SDA_PIN;
+    GPIO_Init(OLED_PORT_GPIO, &c);
 
-    /* Row 0: 心率+血氧 */
-    {
-        char buf[21];
-        uint8_t i;
-        if(!max30102_enabled)
-        {
-            /* MAX30102 已关闭 */
-            char *s = "MAX:OFF             ";
-            for(i=0;i<20;i++) buf[i]=s[i]; buf[20]=0;
-        }
-        else if(!max30102_ok)
-        {
-            /* MAX30102 初始化失败 (检查接线/I2C) */
-            char *s = "MAX:ERR             ";
-            for(i=0;i<20;i++) buf[i]=s[i]; buf[20]=0;
-        }
-        else if(MAX30102_IsValid())
-        {
-            /* HR:XXXbpm SpO2:XX% */
-            buf[0]='H'; buf[1]='R'; buf[2]=':';
-            buf[3]='0'+hr/100; buf[4]='0'+(hr/10)%10; buf[5]='0'+hr%10;
-            buf[6]='b'; buf[7]='p'; buf[8]='m'; buf[9]=' ';
-            buf[10]='S'; buf[11]='p'; buf[12]='O'; buf[13]='2'; buf[14]=':';
-            buf[15]='0'+spo2/10; buf[16]='0'+spo2%10; buf[17]='%';
-            for(i=18;i<21;i++) buf[i]=' ';
-        }
-        else
-        {
-            /* HR:---bpm SpO2:--% */
-            char *s = "HR:---bpm SpO2:--%";
-            for(i=0;i<20;i++) buf[i]=s[i]; buf[20]=0;
-        }
-        OLED_Show_Str(0, 0, buf);
-    }
+    O_SCL_H();
+    O_SDA_H();
 
-    /* Row 2: 药盒1重量 */
-    OLED_Show_Str(0, 2, "W1:       ");
-    OLED_Show_Weight(18, 2, w1);
+    /* MAX30102 SCL(PE12推挽) + SDA(PE13推挽, 方向动态切换) */
+    c.GPIO_Pin   = MAX_SCL_PIN;
+    c.GPIO_Mode  = GPIO_Mode_Out_PP;
+    c.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(MAX_PORT, &c);
 
-    /* Row 3: 药盒2重量 */
-    OLED_Show_Str(0, 3, "W2:       ");
-    OLED_Show_Weight(18, 3, w2);
+    c.GPIO_Pin   = MAX_SDA_PIN;
+    GPIO_Init(MAX_PORT, &c);
 
-    OLED_Select(0);
-}
-
-/*==========================================================================
- * 显示 — 设置模式(分页)
- *==========================================================================*/
-static void Show_Setup(void)
-{
-    uint8_t med_idx = (sel_page <= 1) ? sel_page : 0;
-    uint8_t cursor  = 0;  /* 当前页内的游标 */
-    uint8_t active_slots;
-    uint8_t row;          /* 显示行号 */
-
-    OLED_Clear();
-
-    /* 标题行 */
-    if(sel_page == 0)
-        OLED_Show_Str(0,0,"== Med1 Setup ==");
-    else if(sel_page == 1)
-        OLED_Show_Str(0,0,"== Med2 Setup ==");
-    else
-        OLED_Show_Str(0,0,"== Set Clock  ==");
-
-    /* 右上角页码 */
-    {
-        char pg[4];
-        pg[0] = '0' + sel_page; pg[1] = '/'; pg[2] = '2'; pg[3] = 0;
-        OLED_Show_Str(90,0,pg);
-    }
-
-    if(sel_page <= 1)
-    {
-        active_slots = med[med_idx].times_per_day;
-
-        /* ---- 药盒设置页 ---- */
-        /* Row1: 每次粒数 (cursor=0) */
-        row = 1;
-        OLED_Show_Str(0,row,(sel_item == cursor) ? ">" : " ");
-        OLED_Show_Str(6,row,"Pills/dose:");
-        OLED_Show_Num(78,row,med[med_idx].pills_per_dose,2);
-        cursor++;
-
-        /* Row2: 每天次数 (cursor=1) */
-        row = 2;
-        OLED_Show_Str(0,row,(sel_item == cursor) ? ">" : " ");
-        OLED_Show_Str(6,row,"Times/day:");
-        OLED_Show_Num(78,row,med[med_idx].times_per_day,2);
-        cursor++;
-
-        /* Row3~Row8: 时间段H/M */
-        for(uint8_t s = 0; s < active_slots; s++)
-        {
-            char lbl[4];
-
-            /* 时段-时: row = 3 + s*2 */
-            row = 3 + s * 2;
-            OLED_Show_Str(0,row,(sel_item == cursor) ? ">" : " ");
-            lbl[0] = 'T'; lbl[1] = '1'+s; lbl[2] = 'H'; lbl[3] = 0;
-            OLED_Show_Str(6,row,lbl);
-            OLED_Show_Num(30,row,med[med_idx].slot_h[s],2);
-            cursor++;
-
-            /* 时段-分: row = 4 + s*2 */
-            row = 4 + s * 2;
-            OLED_Show_Str(0,row,(sel_item == cursor) ? ">" : " ");
-            lbl[0] = 'T'; lbl[1] = '1'+s; lbl[2] = 'M'; lbl[3] = 0;
-            OLED_Show_Str(6,row,lbl);
-            OLED_Show_Num(30,row,med[med_idx].slot_m[s],2);
-            cursor++;
-        }
-
-        /* 防止切换次数后 sel_item 越界 */
-        {
-            uint8_t max_item = 2 + active_slots * 2;
-            if(sel_item >= max_item) sel_item = max_item > 0 ? max_item - 1 : 0;
-        }
-
-        OLED_Show_Str(0,7,"K1:sel K2:+  K3:nxt");
-    }
-    else
-    {
-        /* ---- 当前时间页 ---- */
-        OLED_Show_Str(0,1,(sel_item == 0) ? ">" : " ");
-        OLED_Show_Str(6,1,"Hour:");
-        OLED_Show_Num(54,1,cur_h,2);
-
-        OLED_Show_Str(0,2,(sel_item == 1) ? ">" : " ");
-        OLED_Show_Str(6,2,"Min :");
-        OLED_Show_Num(54,2,cur_m,2);
-
-        OLED_Show_Str(0,7,"K1:sel K2:+  K3:OK ");
-    }
-}
-
-/*==========================================================================
- * 显示 — 运行模式 (含双通道实时重量)
- *==========================================================================*/
-static void Show_Run(void)
-{
-    uint32_t sod = rtc_seconds % 86400;
-    uint8_t h = sod / 3600;
-    uint8_t m = (sod % 3600) / 60;
-    uint8_t s = sod % 60;
-    float w1 = Get_Weight(MED_A);
-    float w2 = Get_Weight(MED_B);
-    uint8_t row = 3;
-
-    OLED_Clear();
-
-    /* Row 0: 当前时间 + 状态 */
-    {
-        char t[9];
-        t[0]='0'+h/10; t[1]='0'+h%10; t[2]=':';
-        t[3]='0'+m/10; t[4]='0'+m%10; t[5]=':';
-        t[6]='0'+s/10; t[7]='0'+s%10; t[8]=0;
-        OLED_Show_Str(0,0,t);
-        OLED_Show_Str(54,0,"Running");
-    }
-
-    /* Row 1: 药盒1 实时重量 */
-    OLED_Show_Str(0,1,"W1:");
-    OLED_Show_Weight(18,1,w1);
-    OLED_Show_Str(60,1,"       ");
-    OLED_Show_Char(60,1,'[');
-    {
-        uint8_t stable1 = (w1 >= 0) ? 8 : 0;
-        uint8_t i;
-        for(i=0;i<10;i++)
-        {
-            if(i < stable1)
-                OLED_Show_Char(66+i*6,1,'|');
-            else
-                OLED_Show_Char(66+i*6,1,' ');
-        }
-    }
-    OLED_Show_Char(126,1,']');
-
-    /* Row 2: 药盒2 实时重量 */
-    OLED_Show_Str(0,2,"W2:");
-    OLED_Show_Weight(18,2,w2);
-    OLED_Show_Str(60,2,"       ");
-    OLED_Show_Char(60,2,'[');
-    {
-        uint8_t stable2 = (w2 >= 0) ? 8 : 0;
-        uint8_t i;
-        for(i=0;i<10;i++)
-        {
-            if(i < stable2)
-                OLED_Show_Char(66+i*6,2,'|');
-            else
-                OLED_Show_Char(66+i*6,2,' ');
-        }
-    }
-    OLED_Show_Char(126,2,']');
-
-    /* Row 3-6: 闹钟时段 (紧凑排列) */
-    for(uint8_t idx = 0; idx < MED_COUNT && row <= 6; idx++)
-    {
-        uint8_t ts = med[idx].times_per_day;
-
-        /* 第一行: Mx + 前2个时段 */
-        OLED_Show_Char(0,row,'M');
-        OLED_Show_Char(6,row,'1'+idx);
-        {
-            uint8_t cx = 18;
-            for(uint8_t sl = 0; sl < ts && sl < 2; sl++)
-            {
-                OLED_Show_Char(cx,row,'T'); cx += 6;
-                OLED_Show_Char(cx,row,'1'+sl); cx += 6;
-                OLED_Show_Time(cx,row,med[idx].slot_h[sl],med[idx].slot_m[sl]);
-                cx += 30;
-                if(triggered[idx][sl])
-                {
-                    OLED_Show_Char(cx,row,'['); cx += 6;
-                    OLED_Show_Char(cx,row,'O'); cx += 6;
-                    OLED_Show_Char(cx,row,'K'); cx += 6;
-                    OLED_Show_Char(cx,row,']');
-                }
-                cx += 6;
-            }
-        }
-        row++;
-
-        /* 第二行: 第3个时段 (如果存在) */
-        if(ts > 2 && row <= 6)
-        {
-            uint8_t sl = 2;
-            uint8_t cx = 18;
-            OLED_Show_Char(cx,row,'T'); cx += 6;
-            OLED_Show_Char(cx,row,'1'+sl); cx += 6;
-            OLED_Show_Time(cx,row,med[idx].slot_h[sl],med[idx].slot_m[sl]);
-            if(triggered[idx][sl])
-            {
-                cx += 30;
-                OLED_Show_Char(cx,row,'['); cx += 6;
-                OLED_Show_Char(cx,row,'O'); cx += 6;
-                OLED_Show_Char(cx,row,'K'); cx += 6;
-                OLED_Show_Char(cx,row,']');
-            }
-            row++;
-        }
-    }
-
-    /* Row 7: 按键提示 */
-    OLED_Show_Str(0,7,"K3=back M:tare1 A:tare2");
-}
-
-/*==========================================================================
- * 显示 — 提醒模式 (含取药重量变化)
- *==========================================================================*/
-static void Show_Alert(void)
-{
-    float now_w = Get_Weight(alert_med);
-    float removed = origin_w[alert_med] - now_w;
-    if(now_w < 0) now_w = 0;
-    if(removed < 0) removed = 0;
-
-    OLED_Clear();
-
-    /* Row 0: 标题 */
-    OLED_Show_Str(0,0,"!!! TAKE MED !!!");
-
-    /* Row 1: 哪个药盒 + 吃几粒 */
-    OLED_Show_Str(0,1,"Box:");
-    OLED_Show_Char(30,1,'1'+alert_med);
-    OLED_Show_Str(48,1,"Take:");
-    OLED_Show_Num(78,1,med[alert_med].pills_per_dose,2);
-    OLED_Show_Str(96,1,"pills");
-
-    /* Row 2: 红外状态 */
-    {
-        uint8_t ir = GPIO_ReadInputDataBit(GPIOA, PHOTO_PIN);
-        OLED_Show_Str(0,2,"IR:");
-        OLED_Show_Str(24,2,(ir == 0) ? "Blocked(open)" : "Clear(closed)");
-    }
-
-    /* Row 3: 取药前重量 */
-    OLED_Show_Str(0,3,"Before:");
-    OLED_Show_Weight(42,3,origin_w[alert_med]);
-
-    /* Row 4: 当前重量 */
-    OLED_Show_Str(0,4,"Now:  ");
-    OLED_Show_Weight(42,4,now_w);
-
-    /* Row 5: 已取走重量 */
-    OLED_Show_Str(0,5,"Taken:");
-    OLED_Show_Weight(42,5,removed);
-
-    /* Row 6: 状态提示 */
-    if(removed >= TAKE_WEIGHT && IR_BLOCKED())
-        OLED_Show_Str(0,6,"Taken -> dismiss!");
-    else if(removed >= TAKE_WEIGHT)
-        OLED_Show_Str(0,6,"Open lid to confirm");
-    else
-        OLED_Show_Str(0,6,"Remove pills + open");
-
-    /* Row 7: 按键 */
-    OLED_Show_Str(0,7,"K3:force dismiss");
+    M_SCL_H();
+    M_SDA_H();
 }
 
 /*==========================================================================
@@ -448,343 +354,72 @@ static void Show_Alert(void)
  *==========================================================================*/
 int main(void)
 {
-    uint8_t blink_tick = 0;    /* LED/BEEP 闪烁计数 */
+    uint8_t  part_id;
+    uint16_t count = 0;
+    uint8_t  pass  = 0;
+    char     buf[21];
 
     /*---- 初始化 ----*/
     Delay_Init();
-    GPIO_All_Init();
-    LED_OFF();
-    BEEP_OFF();
+    GPIO_Init_All();
+    O_Init();
+    O_Clear();
 
-    /*---- HX711 去皮 ----*/
-    HX_Tare(MED_A);
-    HX_Tare(MED_B);
+    /*---- 屏显标题 ----*/
+    O_ShowStr(0, 0, "MAX30102 I2C TEST");
+    O_ShowStr(0, 2, "PART_ID: 0x");
+    O_ShowStr(0, 7, "Reading...");
 
-    /*---- TIM2 + OLED ----*/
-    TIM2_Init();                    /* 1Hz 时间基准 */
-    OLED_Init();                    /* OLED1 — 药盒UI (PA0/PA1) */
-    OLED_Select(1); OLED_Init();    /* OLED2 — 称重+心率 (PA2/PA3) */
-    OLED_Select(0);                 /* 切回 OLED1 */
-    Show_OLED2_Init();              /* OLED2 画静态界面(只一次) */
-    Show_Setup();                   /* OLED1 显示设置菜单 */
+    Delay_Ms(100);  /* 等传感器上电稳定 */
 
-    /*---- MAX30102 心率血氧初始化 ----*/
-    MAX30102_Init();
-
-    /*---- 清零触发标记 ----*/
-    for(uint8_t i = 0; i < MED_COUNT; i++)
-    {
-        for(uint8_t j = 0; j < MAX_SLOTS; j++)
-            triggered[i][j] = 0;
-        alert_flag[i]  = 0;
-        voice_ok[i]    = 0;
-        origin_w[i]    = 0;
-    }
-
-    /*---- 主循环 ----*/
+    /*---- 循环读取 PART_ID ----*/
     while(1)
     {
-        /* OLED2 称重显示: 每 ~500ms 刷新数字 (不闪屏) */
-        {
-            static uint8_t oled2_tick = 0;
-            oled2_tick++;
-            if(oled2_tick >= 5)
-            {
-                Show_OLED2();
-                oled2_tick = 0;
-            }
+        part_id = MAX_ReadReg(0xFF);
+        count++;
+
+        /* 显示: 及时显示进屏 */
+        // Row2: 显示读到的值
+        O_ShowStr(0, 2, "PART_ID: 0x");
+        O_ShowHex(66, 2, part_id);
+
+        /* 判断 */
+        if(part_id == 0x15) {
+            O_ShowStr(0, 4, ">> PASS!! <<");
+            pass++;
+        } else if(part_id == 0xFF) {
+            O_ShowStr(0, 4, "FAIL: NACK (no dev)");   /*器件不应答*/
+        } else if(part_id == 0xFE) {
+            O_ShowStr(0, 4, "FAIL: NACK (reg)");        /*寄存器地址不应答*/
+        } else if(part_id == 0xFD) {
+            O_ShowStr(0, 4, "FAIL: NACK (read)");       /*读操作不应答*/
+        } else {
+            O_ShowStr(0, 4, "FAIL: wrong ID");
         }
 
-        /* MAX30102 心率血氧: 每 ~100ms 从FIFO读取样本 */
-
-        /* Button4 (PA6): 切换 MAX30102 开关 */
-        if(Key_Max30102_Scan())
+        /* 重试信息 */
+        O_ShowStr(0, 6, "Retry: ");
         {
-            max30102_enabled = !max30102_enabled;
-            MAX30102_Enable(max30102_enabled);
-            Show_OLED2();  /* 立即刷新OLED2显示状态 */
+            uint8_t i;
+            for(i=0;i<16;i++) buf[i]=' '; buf[16]=0;
+        }
+        O_ShowStr(42, 6, buf);  /* 清旧数字 */
+        {
+            char ns[6];
+            uint8_t pos = 54;
+            ns[0] = '0' + (count / 1000 % 10);
+            ns[1] = '0' + (count / 100  % 10);
+            ns[2] = '0' + (count / 10   % 10);
+            ns[3] = '0' + (count / 1    % 10);
+            ns[4] = 0;
+            O_ShowStr(pos, 6, ns);
+        }
+        O_ShowStr(0, 7, (pass > 0) ? "PASS x" : "       ");
+        if(pass > 0) {
+            O_ShowStr(48, 7, "");
+            O_ShowHex(48, 7, (uint8_t)pass);
         }
 
-        MAX30102_Update();
-
-        /*==========================*/
-        /*  设置模式                */
-        /*==========================*/
-        if(sys_state == STATE_SETUP)
-        {
-            LED_OFF();
-            BEEP_OFF();
-
-            /* K1: 切换选项 */
-            if(Key_Mode_Scan())
-            {
-                sel_item++;
-                if(sel_item >= PageItems(sel_page))
-                    sel_item = 0;
-                Show_Setup();
-            }
-
-            /* K2: 加值 */
-            if(Key_Add_Scan())
-            {
-                uint8_t med_idx = (sel_page <= 1) ? sel_page : 0;
-
-                if(sel_page <= 1)
-                {
-                    uint8_t active = med[med_idx].times_per_day;
-
-                    switch(sel_item)
-                    {
-                        case 0: /* pills_per_dose */
-                            med[med_idx].pills_per_dose++;
-                            if(med[med_idx].pills_per_dose > MAX_PILL)
-                                med[med_idx].pills_per_dose = 1;
-                            break;
-
-                        case 1: /* times_per_day */
-                            med[med_idx].times_per_day++;
-                            if(med[med_idx].times_per_day > MAX_TIMES)
-                                med[med_idx].times_per_day = 1;
-                            /* 如果光标落在不可见的 slot 上, 回退 */
-                            if(sel_item >= PageItems(sel_page))
-                                sel_item = PageItems(sel_page) - 1;
-                            break;
-
-                        default:
-                        {
-                            /* slot H/M */
-                            uint8_t rel = sel_item - 2; /* 相对 pills+times 后的偏移 */
-                            uint8_t slot = rel / 2;
-                            uint8_t hm   = rel % 2;  /* 0=H, 1=M */
-
-                            if(slot < active)
-                            {
-                                if(hm == 0)
-                                {
-                                    med[med_idx].slot_h[slot]++;
-                                    if(med[med_idx].slot_h[slot] > MAX_HOUR)
-                                        med[med_idx].slot_h[slot] = 0;
-                                }
-                                else
-                                {
-                                    med[med_idx].slot_m[slot]++;
-                                    if(med[med_idx].slot_m[slot] > MAX_MIN)
-                                        med[med_idx].slot_m[slot] = 0;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-                else /* 当前时间页 */
-                {
-                    if(sel_item == 0)
-                    {
-                        cur_h++;
-                        if(cur_h > MAX_HOUR) cur_h = 0;
-                    }
-                    else
-                    {
-                        cur_m++;
-                        if(cur_m > MAX_MIN) cur_m = 0;
-                    }
-                }
-                Show_Setup();
-            }
-
-            /* K3: 下一页 / 确认 */
-            if(Key_OK_Scan())
-            {
-                if(sel_page < 2)
-                {
-                    sel_page++;
-                    sel_item = 0;
-                    Show_Setup();
-                }
-                else
-                {
-                    /* 确认 → 进入运行模式 */
-                    rtc_seconds = (uint32_t)cur_h * 3600 + (uint32_t)cur_m * 60;
-                    entry_sec   = rtc_seconds;
-                    last_min    = 0xFF;
-
-                    /* 清零触发标记 */
-                    for(uint8_t i = 0; i < MED_COUNT; i++)
-                    {
-                        alert_flag[i] = 0;
-                        voice_ok[i]   = 0;
-                        for(uint8_t j = 0; j < MAX_SLOTS; j++)
-                            triggered[i][j] = 0;
-                    }
-
-                    sys_state = STATE_RUN;
-                    LED_OFF();
-                    BEEP_OFF();
-                    Show_Run();       /* OLED1 */
-                    Show_OLED2();     /* OLED2 */
-                }
-            }
-        }
-        /*==========================*/
-        /*  运行模式                */
-        /*==========================*/
-        else if(sys_state == STATE_RUN)
-        {
-            uint32_t sod   = rtc_seconds % 86400;
-            uint8_t  h_now = sod / 3600;
-            uint8_t  m_now = (sod % 3600) / 60;
-            uint8_t  s_now = sod % 60;
-
-            /* K3: 返回设置 */
-            if(Key_OK_Scan())
-            {
-                LED_OFF();
-                BEEP_OFF();
-                sys_state = STATE_SETUP;
-                sel_page  = 0;
-                sel_item  = 0;
-                cur_h = h_now;
-                cur_m = m_now;
-                Show_Setup();
-                continue;
-            }
-
-            /* 长按 MODE(PA8): 药盒1去皮 */
-            if(Key_Mode_Hold())
-            {
-                HX_Tare(MED_A);
-            }
-
-            /* 长按 ADD(PA9): 药盒2去皮 */
-            if(Key_Add_Hold())
-            {
-                HX_Tare(MED_B);
-            }
-
-            /* 分钟沿 → 检查所有药盒所有时段 */
-            if(m_now != last_min)
-            {
-                last_min = m_now;
-
-                for(uint8_t idx = 0; idx < MED_COUNT; idx++)
-                {
-                    uint8_t ts = med[idx].times_per_day;
-
-                    for(uint8_t sl = 0; sl < ts; sl++)
-                    {
-                        if(h_now == med[idx].slot_h[sl] &&
-                           m_now == med[idx].slot_m[sl] &&
-                           !triggered[idx][sl] &&
-                           rtc_seconds > entry_sec + 10)
-                        {
-                            /* ✅ 触发! */
-                            triggered[idx][sl] = 1;
-                            alert_med          = idx;
-                            alert_flag[idx]    = 1;
-                            voice_ok[idx]      = 0;
-
-                            /* 记录当前重量用于取药检测 */
-                            origin_w[idx] = Get_Weight(idx);
-
-                            sys_state = STATE_ALERT;
-                            LED_ON();
-                            BEEP_ON();
-                            blink_tick = 0;
-
-                            /* 播报语音 (语音模块稍后接入时自动生效) */
-                            Voice_Play_Alert();
-                            voice_ok[idx] = 1;
-
-                            Show_Alert();
-                            goto break_outer;
-                        }
-                    }
-                }
-            }
-            break_outer:
-
-            /* 00:00 重置当天触发标记 */
-            if(h_now == 0 && m_now == 0 && s_now < 5)
-            {
-                for(uint8_t i = 0; i < MED_COUNT; i++)
-                    for(uint8_t j = 0; j < MAX_SLOTS; j++)
-                        triggered[i][j] = 0;
-            }
-
-            /* 屏幕刷新 */
-            if(refresh_flag)
-            {
-                Show_Run();       /* OLED1: 药盒UI */
-                Show_OLED2();     /* OLED2: 称重显示 */
-                refresh_flag = 0;
-            }
-        }
-        /*==========================*/
-        /*  提醒模式                */
-        /*==========================*/
-        else if(sys_state == STATE_ALERT)
-        {
-            /* 闪烁控制: 500ms ON / 500ms OFF */
-            blink_tick++;
-            if(blink_tick < 5)       /* ~500ms ON */
-            {
-                LED_ON();
-                BEEP_ON();
-            }
-            else if(blink_tick < 10) /* ~500ms OFF */
-            {
-                LED_OFF();
-                BEEP_OFF();
-            }
-            else
-            {
-                blink_tick = 0;
-            }
-
-            /* K3: 手动解除 */
-            if(Key_OK_Scan())
-            {
-                LED_OFF();
-                BEEP_OFF();
-                alert_flag[alert_med] = 0;
-                last_min  = 0xFF;  /* 强制重新检查: 同分钟可能还有别的闹钟 */
-                entry_sec = 0;     /* 移除10秒保护(triggered标记已防重触发) */
-                sys_state = STATE_RUN;
-                Show_Run();        /* OLED1 */
-                Show_OLED2();      /* OLED2 */
-                continue;
-            }
-
-            /* 取药检测: 重量下降 > TAKE_WEIGHT + 红外遮挡(双重判定) */
-            {
-                float now_w = Get_Weight(alert_med);
-                uint8_t ir_blocked = IR_BLOCKED();
-
-                if((origin_w[alert_med] - now_w >= TAKE_WEIGHT) && ir_blocked)
-                {
-                    /* 已取药 → 播报粒数 → 解除告警 */
-                    Voice_Play_Pill(med[alert_med].pills_per_dose);
-
-                    LED_OFF();
-                    BEEP_OFF();
-                    alert_flag[alert_med] = 0;
-                    last_min  = 0xFF;  /* 强制重新检查同分钟其他闹钟 */
-                    entry_sec = 0;
-                    sys_state = STATE_RUN;
-                    Show_Run();        /* OLED1 */
-                    Show_OLED2();      /* OLED2 */
-                    continue;
-                }
-            }
-
-            /* 刷新显示屏 */
-            if((blink_tick % 10) == 0)
-            {
-                Show_Alert();    /* OLED1: 告警信息 */
-                Show_OLED2();    /* OLED2: 称重显示 */
-            }
-        }
-
-        Delay_ms(100); /* 主循环节拍 ~100ms */
+        Delay_Ms(1000);  /* 每秒读一次 */
     }
 }
