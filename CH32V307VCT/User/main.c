@@ -150,6 +150,12 @@ static void Show_OLED2(void)
             char *s = "MAX:OFF             ";
             for(i=0;i<20;i++) buf[i]=s[i]; buf[20]=0;
         }
+        else if(!max30102_ok)
+        {
+            /* MAX30102 初始化失败 (检查接线/I2C) */
+            char *s = "MAX:ERR             ";
+            for(i=0;i<20;i++) buf[i]=s[i]; buf[20]=0;
+        }
         else if(MAX30102_IsValid())
         {
             /* HR:XXXbpm SpO2:XX% */
@@ -450,15 +456,6 @@ int main(void)
     LED_OFF();
     BEEP_OFF();
 
-    /*---- 启动自检: LED 慢闪3次 + 蜂鸣器短鸣1次 ----*/
-    for(int bl = 0; bl < 3; bl++)
-    {
-        LED_ON();  Delay_ms(200);
-        LED_OFF(); Delay_ms(200);
-    }
-    BEEP_ON();  Delay_ms(100);
-    BEEP_OFF();
-
     /*---- HX711 去皮 ----*/
     HX_Tare(MED_A);
     HX_Tare(MED_B);
@@ -638,12 +635,6 @@ int main(void)
             uint8_t  m_now = (sod % 3600) / 60;
             uint8_t  s_now = sod % 60;
 
-            /* LED 心跳: 每10秒闪一下, 显示系统在运行 */
-            if((s_now % 10) == 0 && (rtc_seconds & 1) == 0)
-                LED_ON();
-            else if((s_now % 10) == 1)
-                LED_OFF();
-
             /* K3: 返回设置 */
             if(Key_OK_Scan())
             {
@@ -658,48 +649,16 @@ int main(void)
                 continue;
             }
 
-            /* 长按 MODE(PA8) >1秒: 药盒1去皮 */
+            /* 长按 MODE(PA8): 药盒1去皮 */
+            if(Key_Mode_Hold())
             {
-                static uint8_t  mode_hold = 0;
-                static uint8_t  mode_done = 0;
-                if(GPIO_ReadInputDataBit(GPIOA, KEY_MODE) == 0)
-                {
-                    if(!mode_done)
-                    {
-                        mode_hold++;
-                        if(mode_hold > 10)  /* ~1秒 */
-                        {
-                            HX_Tare(MED_A);
-                            mode_done = 1;
-                            /* LED 快闪3次确认 */
-                            for(int i=0;i<3;i++)
-                            { LED_ON(); Delay_ms(80); LED_OFF(); Delay_ms(80); }
-                        }
-                    }
-                }
-                else { mode_hold = 0; mode_done = 0; }
+                HX_Tare(MED_A);
             }
 
-            /* 长按 ADD(PA9) >1秒: 药盒2去皮 */
+            /* 长按 ADD(PA9): 药盒2去皮 */
+            if(Key_Add_Hold())
             {
-                static uint8_t  add_hold = 0;
-                static uint8_t  add_done = 0;
-                if(GPIO_ReadInputDataBit(GPIOA, KEY_ADD) == 0)
-                {
-                    if(!add_done)
-                    {
-                        add_hold++;
-                        if(add_hold > 10)  /* ~1秒 */
-                        {
-                            HX_Tare(MED_B);
-                            add_done = 1;
-                            /* LED 快闪3次确认 */
-                            for(int i=0;i<3;i++)
-                            { LED_ON(); Delay_ms(80); LED_OFF(); Delay_ms(80); }
-                        }
-                    }
-                }
-                else { add_hold = 0; add_done = 0; }
+                HX_Tare(MED_B);
             }
 
             /* 分钟沿 → 检查所有药盒所有时段 */

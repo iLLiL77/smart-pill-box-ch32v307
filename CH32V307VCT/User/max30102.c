@@ -41,7 +41,8 @@ static int32_t  an_dx[BUFFER_SIZE - MA4_SIZE];
 /*==========================================================================
  * 软件I2C — PE12(SCL推挽) + PE13(SDA开漏)
  *==========================================================================*/
-#define MAX_I2C_DELAY  Delay_Us(2)
+/* I2C时序: ~100kHz 标准模式 (96MHz主频下 Delay_Us(5)=每个电平~5μs) */
+#define MAX_I2C_DELAY  Delay_Us(5)
 
 #define MAX_SDA_H()   GPIO_SetBits(MAX_PORT, MAX_SDA)
 #define MAX_SDA_L()   GPIO_ResetBits(MAX_PORT, MAX_SDA)
@@ -93,57 +94,57 @@ void MAX30102_IIC_Init(void)
 void MAX30102_IIC_Start(void)
 {
     MAX30102_IIC_SDA_OUT();
-    MAX_SDA_H(); MAX_SCL_H(); Delay_Us(4);
-    MAX_SDA_L(); Delay_Us(4); MAX_SCL_L();
+    MAX_SDA_H(); MAX_SCL_H(); Delay_Us(5);
+    MAX_SDA_L(); Delay_Us(5); MAX_SCL_L(); Delay_Us(2);
 }
 
 void MAX30102_IIC_Stop(void)
 {
     MAX30102_IIC_SDA_OUT();
-    MAX_SCL_L(); MAX_SDA_L(); Delay_Us(4);
-    MAX_SCL_H(); MAX_SDA_H(); Delay_Us(4);
+    MAX_SCL_L(); MAX_SDA_L(); Delay_Us(5);
+    MAX_SCL_H(); MAX_SDA_H(); Delay_Us(5);
 }
 
 uint8_t MAX30102_IIC_Wait_Ack(void)
 {
     uint8_t t = 0;
     MAX30102_IIC_SDA_IN();
-    MAX_SDA_H(); Delay_Us(1);
-    MAX_SCL_H(); Delay_Us(1);
+    MAX_SDA_H(); Delay_Us(2);
+    MAX_SCL_H(); Delay_Us(2);
     while (MAX_READ_SDA) {
         if (++t > 250) { MAX30102_IIC_Stop(); return 1; }
     }
-    MAX_SCL_L();
+    MAX_SCL_L(); Delay_Us(2);
     return 0;
 }
 
 void MAX30102_IIC_Ack(void)
 {
-    MAX_SCL_L();
+    MAX_SCL_L(); Delay_Us(2);
     MAX30102_IIC_SDA_OUT();
     MAX_SDA_L(); Delay_Us(2);
-    MAX_SCL_H(); Delay_Us(2);
-    MAX_SCL_L();
+    MAX_SCL_H(); Delay_Us(5);
+    MAX_SCL_L(); Delay_Us(2);
 }
 
 void MAX30102_IIC_NAck(void)
 {
-    MAX_SCL_L();
+    MAX_SCL_L(); Delay_Us(2);
     MAX30102_IIC_SDA_OUT();
     MAX_SDA_H(); Delay_Us(2);
-    MAX_SCL_H(); Delay_Us(2);
-    MAX_SCL_L();
+    MAX_SCL_H(); Delay_Us(5);
+    MAX_SCL_L(); Delay_Us(2);
 }
 
 void MAX30102_IIC_Send_Byte(uint8_t txd)
 {
     uint8_t t;
     MAX30102_IIC_SDA_OUT();
-    MAX_SCL_L();
+    MAX_SCL_L(); Delay_Us(2);
     for (t = 0; t < 8; t++) {
         if (txd & 0x80) MAX_SDA_H(); else MAX_SDA_L();
         txd <<= 1;
-        Delay_Us(2); MAX_SCL_H(); Delay_Us(2); MAX_SCL_L(); Delay_Us(2);
+        Delay_Us(2); MAX_SCL_H(); Delay_Us(5); MAX_SCL_L(); Delay_Us(2);
     }
 }
 
@@ -153,11 +154,12 @@ uint8_t MAX30102_IIC_Read_Byte(unsigned char ack)
     MAX30102_IIC_SDA_IN();
     for (i = 0; i < 8; i++) {
         MAX_SCL_L(); Delay_Us(2);
-        MAX_SCL_H();
+        MAX_SCL_H(); Delay_Us(2);
         recv <<= 1;
         if (MAX_READ_SDA) recv++;
-        Delay_Us(1);
+        Delay_Us(2);
     }
+    MAX_SCL_L(); Delay_Us(2);
     if (!ack) MAX30102_IIC_NAck(); else MAX30102_IIC_Ack();
     return recv;
 }
